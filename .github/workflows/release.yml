@@ -9,91 +9,143 @@ on:
 permissions:
   contents: write
 
-env:
-  CFLAGS: -Os -ffunction-sections -fdata-sections -Wl,--gc-sections
-
 jobs:
-  build:
-    name: build tun_${{ matrix.artifact }}
-    runs-on: ubuntu-latest
+  linux:
+    name: build tun_linux_${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - tuple: x86_64-linux-musl
-            cc: x86_64-linux-musl-gcc
-            artifact: x86_64
-          - tuple: i686-linux-musl
-            cc: i686-linux-musl-gcc
-            artifact: i686
-          - tuple: aarch64-linux-musl
-            cc: aarch64-linux-musl-gcc
-            artifact: arm64
-          - tuple: armv7l-linux-musleabihf
-            cc: armv7l-linux-musleabihf-gcc
-            artifact: armv7
-          - tuple: armv6-linux-musleabihf
-            cc: armv6-linux-musleabihf-gcc
-            artifact: armv6
-          - tuple: mips-linux-musl
-            cc: mips-linux-musl-gcc
-            artifact: mips
-          - tuple: mipsel-linux-musl
-            cc: mipsel-linux-musl-gcc
-            artifact: mipsel
-          - tuple: mips64-linux-musl
-            cc: mips64-linux-musl-gcc
-            artifact: mips64
-          - tuple: powerpc-linux-musl
-            cc: powerpc-linux-musl-gcc
-            artifact: powerpc
-          - tuple: powerpc64-linux-musl
-            cc: powerpc64-linux-musl-gcc
-            artifact: powerpc64
-          - tuple: riscv64-linux-musl
-            cc: riscv64-linux-musl-gcc
-            artifact: riscv64
-          - tuple: s390x-linux-musl
-            cc: s390x-linux-musl-gcc
-            artifact: s390x
-          - tuple: m68k-linux-musl
-            cc: m68k-linux-musl-gcc
-            artifact: m68k
-          - tuple: sh4-linux-musl
-            cc: sh4-linux-musl-gcc
-            artifact: sh4
+          - artifact: x86_64
+            runner: ubuntu-24.04
+          - artifact: arm64
+            runner: ubuntu-24.04-arm
+
+    env:
+      CFLAGS: -Os -ffunction-sections -fdata-sections -Wl,--gc-sections
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl cross toolchain
+      - name: Install musl-tools
         run: |
-          mkdir -p "$HOME/musl"
-          curl -fsSL "https://musl.cc/${{ matrix.tuple }}-cross.tgz" -o musl.tgz
-          tar -xzf musl.tgz -C "$HOME/musl"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build static binary
         run: |
-          export PATH="$HOME/musl/${{ matrix.tuple }}-cross/bin:$PATH"
-          ${{ matrix.cc }} ${{ env.CFLAGS }} -static -s tun.c -o tun_${{ matrix.artifact }}
-          file tun_${{ matrix.artifact }}
+          musl-gcc $CFLAGS -static -s -pthread tun.c -o tun_linux_${{ matrix.artifact }}
+          file tun_linux_${{ matrix.artifact }}
 
       - name: Checksum
-        run: sha256sum tun_${{ matrix.artifact }} | tee tun_${{ matrix.artifact }}.sha256
+        run: sha256sum tun_linux_${{ matrix.artifact }} | tee tun_linux_${{ matrix.artifact }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tun_${{ matrix.artifact }}
+          name: tun_linux_${{ matrix.artifact }}
           path: |
-            tun_${{ matrix.artifact }}
-            tun_${{ matrix.artifact }}.sha256
+            tun_linux_${{ matrix.artifact }}
+            tun_linux_${{ matrix.artifact }}.sha256
 
       - name: Attach to GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            tun_${{ matrix.artifact }}
-            tun_${{ matrix.artifact }}.sha256
+            tun_linux_${{ matrix.artifact }}
+            tun_linux_${{ matrix.artifact }}.sha256
+          fail_on_unmatched_files: true
+
+  macos:
+    name: build tun_macos_${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+
+    env:
+      CFLAGS: -Os -ffunction-sections -fdata-sections -Wl,-dead_strip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS binary
+        run: |
+          cc $CFLAGS tun.c -o tun_macos_${{ matrix.arch }}
+          strip tun_macos_${{ matrix.arch }}
+          file tun_macos_${{ matrix.arch }}
+
+      - name: Checksum
+        run: shasum -a 256 tun_macos_${{ matrix.arch }} | tee tun_macos_${{ matrix.arch }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun_macos_${{ matrix.arch }}
+          path: |
+            tun_macos_${{ matrix.arch }}
+            tun_macos_${{ matrix.arch }}.sha256
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tun_macos_${{ matrix.arch }}
+            tun_macos_${{ matrix.arch }}.sha256
+          fail_on_unmatched_files: true
+
+  windows:
+    name: build tun_windows_${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            cc: x86_64-w64-mingw32-gcc
+          - arch: i686
+            cc: i686-w64-mingw32-gcc
+
+    env:
+      CFLAGS: -Os -ffunction-sections -fdata-sections -Wl,--gc-sections
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+
+      - name: Build Windows binary
+        run: |
+          ${{ matrix.cc }} $CFLAGS -static -s -lws2_32 tun.c -o tun_windows_${{ matrix.arch }}.exe
+          file tun_windows_${{ matrix.arch }}.exe
+
+      - name: Checksum
+        run: sha256sum tun_windows_${{ matrix.arch }}.exe | tee tun_windows_${{ matrix.arch }}.exe.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun_windows_${{ matrix.arch }}
+          path: |
+            tun_windows_${{ matrix.arch }}.exe
+            tun_windows_${{ matrix.arch }}.exe.sha256
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tun_windows_${{ matrix.arch }}.exe
+            tun_windows_${{ matrix.arch }}.exe.sha256
           fail_on_unmatched_files: true

@@ -20,7 +20,8 @@ Example:
 ./tun 156.232.88.212 secretkey99
 ```
 
-The client immediately forks into the background and returns control to your shell. The control
+The client immediately forks into the background and returns control to your shell (Linux/macOS; on
+Windows keep it running yourself, e.g. as a scheduled task). The control
 server receives your PSK, then drives the client with 9-byte command blocks.
 
 | Byte 0 (command) | Meaning                    | Payload (8 bytes)                        |
@@ -49,9 +50,11 @@ pgrep -laf tun
 ps -ef | grep [t]un
 
 # 2. Live control connection to your server:7000
-ss -tnp | grep tun
+ss -tnp | grep tun       # Linux
 # or
 netstat -tnp | grep tun
+# macOS: lsof -iTCP -a -p <pid>
+# Windows: netstat -ano | findstr <pid>
 ```
 
 The `ESTABLISHED` socket show the client is currently connected to the control server. **Note:**
@@ -87,25 +90,12 @@ automatically, and a `0x00` always stops everything.
 
 ## Build
 
-### Native build (one machine)
+`make` builds `tun` for your host machine. The Makefile also exposes macOS and Windows targets.
 
-```sh
-gcc -Os -ffunction-sections -fdata-sections -Wl,--gc-sections -static -s tun.c -o tun
-```
+### Release build (all platforms at once)
 
-### Cross-compile (needs the matching musl cross-gcc installed)
-
-```sh
-make            # x86_64 (default)
-make tun_mips   # MIPS routers
-make tun_arm64  # ARM64 (RouterOS / OpenWrt)
-```
-
-### Release build (all machines at once)
-
-The repo ships `.github/workflows/release.yml`. Push a tag and GitHub Actions cross-compiles
-fully static binaries for every supported architecture, attaching each binary plus its `.sha256`
-checksum to the Release:
+The repo ships `.github/workflows/release.yml`. Push a tag and GitHub Actions builds every
+platform, attaching each binary plus its `.sha256` checksum to the Release:
 
 ```sh
 git tag v1.0.0
@@ -115,15 +105,16 @@ git push origin v1.0.0
 Or run the workflow manually (Actions tab → "release" → Run workflow): everything is uploaded as
 build artifacts, and attaching to a Release requires a tag push.
 
-Supported architectures (all Linux, musl-libc statically linked):
+Supported binaries:
 
 ```
-x86_64  i686  arm64  armv7  armv6  mips  mipsel  mips64
-powerpc powerpc64 riscv64 s390x m68k sh4
+Linux (static, musl): tun_linux_x86_64   tun_linux_arm64
+macOS:                 tun_macos_x86_64  tun_macos_arm64
+Windows:               tun_windows_x86_64.exe  tun_windows_i686.exe
 ```
 
-Pick the binary that matches the target machine's CPU. A statically linked x86_64 build runs on
-any x86_64 Linux, but it will **not** run on an ARM/MIPS device — use that device's variant.
+On Windows, run via `tun.exe <control-server-ip> <psk>`. A statically linked x86_64 Linux build
+runs on any x86_64 Linux; `tun_linux_arm64` targets ARM64 Linux (RouterOS / OpenWrt).
 
 ---
 
@@ -162,8 +153,10 @@ print("reply:", s.recv(1024))          # expect: b"ECHO:ping"
 - **Auth**: the PSK is sent in cleartext over the control channel. On hostile networks, wrap the
   control link in a VPN or encrypt at a higher layer. The connection is always outbound, so NAT /
   firewalls don't block the initial handshake.
-- **Linux only.** Kernel 3.2+; no libc or framework dependencies thanks to static musl builds.
-- **Windows / macOS / BSD** are not targeted by the current source or the release matrix.
-- `loongarch64` is not available as a prebuilt musl toolchain, so it is not in the release matrix.
+- **Linux / macOS / Windows.** Linux binaries are statically linked (musl); macOS and Windows use
+  their native toolchains (Apple clang, MinGW-w64). The client daemonizes on Linux/macOS but runs in
+  the foreground on Windows. Kernel 3.2+ for the Linux builds; no libc or framework dependencies
+  thanks to static musl builds.
+- **BSD** is not in the release matrix.
 - No persistence: nothing writes config or state anywhere on the node; the orchestrator is the
   only source of truth. If the machine reboots, re-run the binary.

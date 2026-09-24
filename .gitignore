@@ -1,4 +1,5 @@
 tun
-tun_x86_64
-tun_mips
-tun_arm64
+tun_linux_*
+tun_macos_*
+tun_windows_*.exe
+tun_*.sha256
