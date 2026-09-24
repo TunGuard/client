@@ -1,0 +1,91 @@
+TUN Engine: Technical Specification &
+Blueprint
+A highly portable, zero-configuration networking engine designed to run as an un-aware client controlled fully by
+a remote orchestrator.
+
+Phase 1: Architectural Blueprint & Protocol Specs
+The TUN design treats the client as a pure 'dumb pipe'. It removes all routing logic, configurations, and state
+persistence from the endpoint. The client connects outbound to the master Control Server via a persistent TCP
+socket and remains in an idle state until a command byte drops in.
+Command Code Mode Type Payload Structure
+0x00 State Reset / Idle None. Drops active threads and sleeps.
+0x01 FRP Reverse Proxy 2 Bytes (Local Port) + 2 Bytes (Remote Port)
+0x02 P2P Mesh Network 4 Bytes (Target IP) + 2 Bytes (Target Port)
+
+Phase 2: Client Implementation (Pure C Skeleton)
+To ensure the client operates transparently on background memory profiles without standard framework
+constraints or systemd tracking layers, standard Unix double-fork techniques are embedded straight into the
+runtime binary execution chain.
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#define CMD_RESET 0x00
+#define CMD_FRP 0x01
+#define CMD_P2P 0x02
+struct ControlPacket {
+uint8_t command;
+uint8_t payload[8];
+};
+void daemonize() {
+pid_t pid = fork();
+if (pid < 0) exit(EXIT_FAILURE);
+if (pid > 0) exit(EXIT_SUCCESS);
+if (setsid() < 0) exit(EXIT_FAILURE);
+pid = fork();
+if (pid < 0) exit(EXIT_FAILURE);
+
+if (pid > 0) exit(EXIT_SUCCESS);
+umask(0);
+chdir("/");
+close(STDIN_FILENO);
+close(STDOUT_FILENO);
+close(STDERR_FILENO);
+}
+int main(int argc, char *argv[]) {
+if (argc < 3) return 1;
+char *server_ip = argv[1];
+char *psk = argv[2];
+daemonize(); // Push completely into background memory
+while (1) {
+int control_fd = socket(AF_INET, SOCK_STREAM, 0);
+struct sockaddr_in srv = { .sin_family = AF_INET, .sin_port = htons(7000), .sin_addr.s
+_addr = inet_addr(server_ip) };
+if (connect(control_fd, (struct sockaddr *)&srv;, sizeof(srv)) < 0) {
+sleep(5); continue;
+}
+send(control_fd, psk, strlen(psk), 0);
+struct ControlPacket pkt;
+while (recv(control_fd, &pkt;, sizeof(pkt), 0) > 0) {
+if (pkt.command == CMD_FRP) { /* Trigger TCP Stream Multiplexer */ }
+else if (pkt.command == CMD_P2P) { /* Trigger UDP STUN Hole-Punch */ }
+else if (pkt.command == CMD_RESET) { /* Reset pipeline state */ }
+}
+close(control_fd); sleep(2);
+}
+return 0;
+}
+Phase 3: Cross-Compilation Recipes
+Compile using static compilation steps linked explicitly against musl-libc to strip dynamic system library
+lookups. This allows execution on any locked down consumer router operating systems natively.
+# Compiling for Standard PCs/Servers (x86_64)
+musl-gcc -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections -static tun.c -o tun_x86
+_64
+# Cross-Compiling for Older Home Routers (MIPS)
+mips-linux-musl-gcc -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections -static tun.c
+-o tun_mips
+# Cross-Compiling for ARM64 Architectures (RouterOS/OpenWrt)
+aarch64-linux-musl-gcc -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections -static tu
+n.c -o tun_arm64
+Phase 4: Operational Verification & Guide
+1. Start the Client Node: Pass only the targeting coordination engine IP address accompanied by the user
+pre-shared matchmaking key string.
+./tun 192.168.1.50 secretkey99
+
+2. Toggle Server Logic: Clicking triggers inside your central dashboard database interface fires fixed control
+blocks down the socket. The node converts runtime pipeline models from FRP multiplex proxies directly over to
+high speed low-latency P2P mesh parameters without breaking connection paths.

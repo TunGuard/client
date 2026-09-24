@@ -1,0 +1,99 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CFLAGS: -Os -ffunction-sections -fdata-sections -Wl,--gc-sections
+
+jobs:
+  build:
+    name: build tun_${{ matrix.artifact }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tuple: x86_64-linux-musl
+            cc: x86_64-linux-musl-gcc
+            artifact: x86_64
+          - tuple: i686-linux-musl
+            cc: i686-linux-musl-gcc
+            artifact: i686
+          - tuple: aarch64-linux-musl
+            cc: aarch64-linux-musl-gcc
+            artifact: arm64
+          - tuple: armv7l-linux-musleabihf
+            cc: armv7l-linux-musleabihf-gcc
+            artifact: armv7
+          - tuple: armv6-linux-musleabihf
+            cc: armv6-linux-musleabihf-gcc
+            artifact: armv6
+          - tuple: mips-linux-musl
+            cc: mips-linux-musl-gcc
+            artifact: mips
+          - tuple: mipsel-linux-musl
+            cc: mipsel-linux-musl-gcc
+            artifact: mipsel
+          - tuple: mips64-linux-musl
+            cc: mips64-linux-musl-gcc
+            artifact: mips64
+          - tuple: powerpc-linux-musl
+            cc: powerpc-linux-musl-gcc
+            artifact: powerpc
+          - tuple: powerpc64-linux-musl
+            cc: powerpc64-linux-musl-gcc
+            artifact: powerpc64
+          - tuple: riscv64-linux-musl
+            cc: riscv64-linux-musl-gcc
+            artifact: riscv64
+          - tuple: s390x-linux-musl
+            cc: s390x-linux-musl-gcc
+            artifact: s390x
+          - tuple: m68k-linux-musl
+            cc: m68k-linux-musl-gcc
+            artifact: m68k
+          - tuple: sh4-linux-musl
+            cc: sh4-linux-musl-gcc
+            artifact: sh4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl cross toolchain
+        run: |
+          mkdir -p "$HOME/musl"
+          curl -fsSL "https://musl.cc/${{ matrix.tuple }}-cross.tgz" -o musl.tgz
+          tar -xzf musl.tgz -C "$HOME/musl"
+
+      - name: Build static binary
+        run: |
+          export PATH="$HOME/musl/${{ matrix.tuple }}-cross/bin:$PATH"
+          ${{ matrix.cc }} ${{ env.CFLAGS }} -static -s tun.c -o tun_${{ matrix.artifact }}
+          file tun_${{ matrix.artifact }}
+
+      - name: Checksum
+        run: sha256sum tun_${{ matrix.artifact }} | tee tun_${{ matrix.artifact }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun_${{ matrix.artifact }}
+          path: |
+            tun_${{ matrix.artifact }}
+            tun_${{ matrix.artifact }}.sha256
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tun_${{ matrix.artifact }}
+            tun_${{ matrix.artifact }}.sha256
+          fail_on_unmatched_files: true
