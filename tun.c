@@ -51,8 +51,17 @@ static void thread_detach(thread_t t) { pthread_detach(t); }
 #define CMD_RESET 0x00
 #define CMD_FRP 0x01
 #define CMD_P2P 0x02
+#define CMD_TRP 0x03
 #define CTRL_PORT 7000
 #define RELAY_BUF 8192
+#define TUN_PATH_MAX 512
+#define TUN_LINE_MAX 256
+
+/* TRP pull-mode reverse proxy payload (8 bytes):
+ *   [0..3] target IPv4 (raw), 0 = 127.0.0.1
+ *   [4..5] service port (big-endian) — port of the local service
+ *   [6..7] public port   (big-endian) — server port the client dials back
+ */
 
 struct ControlPacket {
     uint8_t command;
@@ -61,6 +70,141 @@ struct ControlPacket {
 
 static volatile int g_frp_stop = 0;
 static volatile int g_p2p_stop = 0;
+static volatile int g_trp_stop = 0;
+
+static char g_exe_path[TUN_PATH_MAX];
+static char g_cfg_path[TUN_PATH_MAX];
+
+/* Absolute path of this binary, so the boot hooks can re-exec it.
+ * On Windows the real path comes from the loader; argv[0] may just be a name. */
+static void resolve_exe_path(const char *argv0)
+{
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, g_exe_path, (DWORD)sizeof(g_exe_path));
+    if (n && n < sizeof(g_exe_path)) { g_exe_path[n] = '\0'; return; }
+#endif
+    snprintf(g_exe_path, sizeof(g_exe_path), "%s", argv0 ? argv0 : "tun");
+}
+
+/* Config lives next to the binary by default, so it stays writable on Android
+ * (app files dir), on a USB stick, and in /opt. TUN_CONFIG overrides it. */
+static void resolve_cfg_path(void)
+{
+    const char *env = getenv("TUN_CONFIG");
+    if (env && *env) {
+        snprintf(g_cfg_path, sizeof(g_cfg_path), "%s", env);
+        return;
+    }
+    char *slash = strrchr(g_exe_path, '/');
+#ifdef _WIN32
+    char *bslash = strrchr(g_exe_path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
+    if (slash) {
+        size_t dlen = (size_t)(slash - g_exe_path);
+        if (dlen + sizeof("/tun.conf") <= sizeof(g_cfg_path)) {
+            memcpy(g_cfg_path, g_exe_path, dlen);
+            memcpy(g_cfg_path + dlen, "/tun.conf", sizeof("/tun.conf"));
+        } else {
+            g_cfg_path[0] = '\0';
+        }
+    } else {
+        snprintf(g_cfg_path, sizeof(g_cfg_path), "%s", "tun.conf");
+    }
+}
+
+static int load_config(char *server, size_t sn, char *psk, size_t pn)
+{
+    FILE *f = fopen(g_cfg_path, "r");
+    if (!f) return -1;
+    char line[TUN_LINE_MAX];
+    server[0] = '\0';
+    psk[0] = '\0';
+    while (fgets(line, (int)sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        if (!strncmp(line, "server=", 7)) snprintf(server, sn, "%s", line + 7);
+        else if (!strncmp(line, "psk=", 4)) snprintf(psk, pn, "%s", line + 4);
+    }
+    fclose(f);
+    return (server[0] && psk[0]) ? 0 : -1;
+}
+
+static int save_config(const char *server, const char *psk)
+{
+    FILE *f = fopen(g_cfg_path, "w");
+    if (!f) return -1;
+    fprintf(f, "server=%s\npsk=%s\n", server, psk);
+    fclose(f);
+#ifndef _WIN32
+    if (chmod(g_cfg_path, S_IRUSR | S_IWUSR) != 0) { /* best effort */ }
+#endif
+    return 0;
+}
+
+static int running_as_root(void)
+{
+#ifdef _WIN32
+    return 1; /* the registry write itself is the privilege test */
+#else
+    return geteuid() == 0;
+#endif
+}
+
+/* Re-launch us on boot. Every backend is best effort and silently no-ops when
+ * it is not applicable or not permitted, so the client still runs normally. */
+static int install_autostart(const char *server, const char *psk)
+{
+    if (!running_as_root()) return -1;
+#ifdef _WIN32
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return -1;
+    char cmd[TUN_PATH_MAX + TUN_LINE_MAX * 2];
+    snprintf(cmd, sizeof(cmd), "\"%s\" %s %s", g_exe_path, server, psk);
+    LONG r = RegSetValueExA(k, "tun", 0, REG_SZ, (const BYTE *)cmd,
+                            (DWORD)(strlen(cmd) + 1));
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS ? 0 : -1;
+#elif defined(__ANDROID__)
+    /* Magisk runs everything in /data/adb/service.d as root at boot. */
+    if (access("/data/adb/service.d", F_OK) != 0) return -1;
+    FILE *f = fopen("/data/adb/service.d/tun.sh", "w");
+    if (!f) return -1;
+    fprintf(f, "#!/system/bin/sh\n"
+               "# written by tun; re-runs the client after reboot\n"
+               "sleep 20\n"
+               "%s %s %s >/dev/null 2>&1 &\n", g_exe_path, server, psk);
+    fclose(f);
+    return chmod("/data/adb/service.d/tun.sh",
+                 S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+#else
+    /* Guard on systemd so Android/BSD/containers never get a stray unit file. */
+    if (access("/run/systemd/system", F_OK) != 0) return -1;
+    FILE *f = fopen("/etc/systemd/system/tun.service", "w");
+    if (!f) return -1;
+    fprintf(f,
+            "[Unit]\n"
+            "Description=tun client\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "Environment=TUN_FOREGROUND=1\n"
+            "ExecStart=\"%s\" %s %s\n"
+            "Restart=always\n"
+            "RestartSec=5\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n",
+            g_exe_path, server, psk);
+    fclose(f);
+    if (system("systemctl daemon-reload >/dev/null 2>&1 && "
+               "systemctl enable tun.service >/dev/null 2>&1") != 0)
+        return -1;
+    return 0;
+#endif
+}
 
 #ifndef _WIN32
 static void daemonize(void)
@@ -249,6 +393,55 @@ THREAD_FN(p2p_session)
     THREAD_EXIT;
 }
 
+struct trp_arg {
+    char server_ip[16];
+    uint32_t target_ip;
+    uint16_t service_port;
+    uint16_t public_port;
+};
+
+/* TRP pull-mode: the control server instructs the client to dial back the
+ * server's public port AND its own local service, then pumps the two. One
+ * session per command; each is a detached thread. */
+THREAD_FN(trp_session)
+{
+    struct trp_arg *ta = (struct trp_arg *)arg;
+    struct sockaddr_in sa;
+    sock_t up = socket(AF_INET, SOCK_STREAM, 0);
+    sock_t lo = socket(AF_INET, SOCK_STREAM, 0);
+    if (up == INVALID_SOCKET || lo == INVALID_SOCKET) {
+        if (up != INVALID_SOCKET) CLOSE_SOCK(up);
+        if (lo != INVALID_SOCKET) CLOSE_SOCK(lo);
+        free(ta);
+        THREAD_EXIT;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(ta->public_port);
+    sa.sin_addr.s_addr = inet_addr(ta->server_ip);
+    if (connect(up, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        CLOSE_SOCK(up);
+        CLOSE_SOCK(lo);
+        free(ta);
+        THREAD_EXIT;
+    }
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(ta->service_port);
+    sa.sin_addr.s_addr = ta->target_ip ? ta->target_ip : inet_addr("127.0.0.1");
+    if (connect(lo, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        CLOSE_SOCK(up);
+        CLOSE_SOCK(lo);
+        free(ta);
+        THREAD_EXIT;
+    }
+    pump(up, lo, &g_trp_stop);
+    CLOSE_SOCK(up);
+    CLOSE_SOCK(lo);
+    free(ta);
+    THREAD_EXIT;
+}
+
 static thread_t frp_thr;
 static thread_t p2p_thr;
 static int frp_running = 0;
@@ -265,11 +458,26 @@ static void stop_session(int *running, thread_t *t, volatile int *stop)
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3) return 1;
-    char *server_ip = argv[1];
-    char *psk = argv[2];
+    resolve_exe_path(argv[0]);
+    resolve_cfg_path();
+
+    char server_ip[TUN_LINE_MAX];
+    char psk[TUN_LINE_MAX];
+    server_ip[0] = '\0';
+    psk[0] = '\0';
+    if (argc >= 3) {
+        snprintf(server_ip, sizeof(server_ip), "%s", argv[1]);
+        snprintf(psk, sizeof(psk), "%s", argv[2]);
+        if (save_config(server_ip, psk) == 0) install_autostart(server_ip, psk);
+    } else if (load_config(server_ip, sizeof(server_ip), psk, sizeof(psk)) != 0) {
+        fprintf(stderr, "usage: %s <control-server-ip> <psk>\n", g_exe_path);
+        return 1;
+    }
 #ifndef _WIN32
-    daemonize();
+    {
+        const char *fg = getenv("TUN_FOREGROUND");
+        if (!(fg && *fg && strcmp(fg, "0") != 0)) daemonize();
+    }
 #else
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
@@ -288,6 +496,11 @@ int main(int argc, char *argv[])
             continue;
         }
         if (send(control_fd, psk, (int)strlen(psk), 0) <= 0) {
+            CLOSE_SOCK(control_fd);
+            SLEEP_MS(2000);
+            continue;
+        }
+        if (send(control_fd, "\n", 1, 0) <= 0) {
             CLOSE_SOCK(control_fd);
             SLEEP_MS(2000);
             continue;
@@ -317,9 +530,26 @@ int main(int argc, char *argv[])
                 pa->target_port = target_port;
                 if (thread_create(&p2p_thr, p2p_session, pa) != 0) free(pa);
                 else p2p_running = 1;
+            } else if (pkt.command == CMD_TRP) {
+                uint32_t target_ip;
+                memcpy(&target_ip, pkt.payload, 4);
+                uint16_t service_port = (uint16_t)((pkt.payload[4] << 8) | pkt.payload[5]);
+                uint16_t public_port = (uint16_t)((pkt.payload[6] << 8) | pkt.payload[7]);
+                g_trp_stop = 0;
+                struct trp_arg *ta = (struct trp_arg *)malloc(sizeof(*ta));
+                if (!ta) continue;
+                memset(ta, 0, sizeof(*ta));
+                strncpy(ta->server_ip, server_ip, sizeof(ta->server_ip) - 1);
+                ta->target_ip = target_ip;
+                ta->service_port = service_port;
+                ta->public_port = public_port;
+                thread_t th;
+                if (thread_create(&th, trp_session, ta) != 0) free(ta);
+                else thread_detach(th);
             } else if (pkt.command == CMD_RESET) {
                 stop_session(&frp_running, &frp_thr, &g_frp_stop);
                 stop_session(&p2p_running, &p2p_thr, &g_p2p_stop);
+                g_trp_stop = 1;
             }
         }
         CLOSE_SOCK(control_fd);

@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  NDK_VERSION: 27.2.12479018
+
 jobs:
   linux:
     name: build tun_linux_${{ matrix.artifact }}
@@ -125,9 +128,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
 
+      # -lws2_32 must follow tun.c: ld resolves left to right and drops a
+      # library placed before the object that references it.
       - name: Build Windows binary
         run: |
-          ${{ matrix.cc }} $CFLAGS -static -s -lws2_32 tun.c -o tun_windows_${{ matrix.arch }}.exe
+          ${{ matrix.cc }} $CFLAGS -static -s tun.c -o tun_windows_${{ matrix.arch }}.exe -lws2_32
           file tun_windows_${{ matrix.arch }}.exe
 
       - name: Checksum
@@ -148,4 +153,59 @@ jobs:
           files: |
             tun_windows_${{ matrix.arch }}.exe
             tun_windows_${{ matrix.arch }}.exe.sha256
+          fail_on_unmatched_files: true
+
+  android:
+    name: build tun_android_*
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "ndk;$NDK_VERSION"
+
+      # Bionic, not glibc: the NDK toolchain is the only supported way to build
+      # for Android. Binaries stay dynamically linked (no -static) because bionic
+      # rejects static executables on ARM/ARM64 below API 29.
+      - name: Build Android binaries
+        run: |
+          make ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" android
+          for f in tun_android_*; do
+            file "$f"
+            readelf -h "$f" | grep -E 'Class|Type|Machine'
+            readelf -l "$f" | grep -A1 'INTERP' | tail -1
+          done
+
+      - name: Checksum
+        run: |
+          for f in tun_android_*; do
+            sha256sum "$f" | tee "$f.sha256"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun_android
+          path: |
+            tun_android_*
+            !tun_android_*.sha256
+          if-no-files-found: error
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: tun_android_sha256
+          path: tun_android_*.sha256
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tun_android_*
           fail_on_unmatched_files: true

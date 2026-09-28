@@ -2,4 +2,7 @@ tun
 tun_linux_*
 tun_macos_*
 tun_windows_*.exe
+tun_android_*
 tun_*.sha256
+tun.conf
+.*.swp
