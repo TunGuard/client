@@ -10,7 +10,8 @@ permissions:
   contents: write
 
 env:
-  NDK_VERSION: 27.2.12479018
+  NDK_RELEASE: r27c
+  NDK_SDK_VERSION: 27.2.12479018
 
 jobs:
   linux:
@@ -128,11 +129,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
 
-      # -lws2_32 must follow tun.c: ld resolves left to right and drops a
-      # library placed before the object that references it.
+      # -lws2_32 / -ladvapi32 must follow tun.c: ld resolves left to right and
+      # drops a library placed before the object that references it. advapi32
+      # backs the CryptoAPI device-id entropy source.
       - name: Build Windows binary
         run: |
-          ${{ matrix.cc }} $CFLAGS -static -s tun.c -o tun_windows_${{ matrix.arch }}.exe -lws2_32
+          ${{ matrix.cc }} $CFLAGS -static -s tun.c -o tun_windows_${{ matrix.arch }}.exe -lws2_32 -ladvapi32
           file tun_windows_${{ matrix.arch }}.exe
 
       - name: Checksum
@@ -162,28 +164,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: android-actions/setup-android@v3
+      # Deliberately not android-actions/setup-android + sdkmanager: that action
+      # runs `sdkmanager --licenses`, which drops into an interactive
+      # "Review licenses that have not been accepted (y/N)?" prompt and hangs the
+      # step. The NDK is a plain zip, so install it directly: no JDK, no licence
+      # prompt, one less moving part.
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: ndk.zip
+          key: ndk-${{ env.NDK_RELEASE }}
 
       - name: Install NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "ndk;$NDK_VERSION"
+          if [ ! -s ndk.zip ]; then
+            curl -fsSL --retry 5 --retry-all-errors -o ndk.zip \
+              "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_RELEASE }}-linux.zip"
+          fi
+          unzip -q -o ndk.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-${{ env.NDK_RELEASE }}" >> "$GITHUB_ENV"
 
       # Bionic, not glibc: the NDK toolchain is the only supported way to build
       # for Android. Binaries stay dynamically linked (no -static) because bionic
       # rejects static executables on ARM/ARM64 below API 29.
       - name: Build Android binaries
         run: |
-          make ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" android
+          make android
           for f in tun_android_*; do
+            case "$f" in *.sha256) continue;; esac
             file "$f"
             readelf -h "$f" | grep -E 'Class|Type|Machine'
             readelf -l "$f" | grep -A1 'INTERP' | tail -1
+            # bionic only: no glibc versioned symbols may appear
+            readelf --dyn-syms "$f" | grep -c 'GLIBC_' && exit 1 || true
           done
 
       - name: Checksum
         run: |
-          for f in tun_android_*; do
+          for f in tun_android_arm64-v8a tun_android_armeabi-v7a tun_android_x86_64; do
             sha256sum "$f" | tee "$f.sha256"
           done
 

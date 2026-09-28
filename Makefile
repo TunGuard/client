@@ -15,6 +15,8 @@ ANDROID_CC_x86_64 ?= $(NDK_BIN)/x86_64-linux-android$(ANDROID_API)-clang
 
 CFLAGS := -Os -ffunction-sections -fdata-sections
 WINSOCK := -lws2_32
+# advapi32 backs the CryptoAPI device-id entropy source (CryptGenRandom).
+WINSOCK_ALL := -lws2_32 -ladvapi32
 ANDROID_CFLAGS := $(CFLAGS) -fPIE
 ANDROID_LDFLAGS := -pie -Wl,--gc-sections -Wl,-z,relro,-z,now
 
@@ -47,14 +49,15 @@ tun_macos_arm64: tun.c
 
 # ---- Windows -----------------------------------------------------------------
 
-# NOTE: -lws2_32 must come *after* tun.c. GNU ld resolves left to right, so a
-# library listed before the object that needs it is dropped as unused -- which
-# is what produced the "undefined reference to `_imp__recv@16'" link failure.
+# NOTE: -lws2_32 / -ladvapi32 must come *after* tun.c. GNU ld resolves left to
+# right, so a library listed before the object that needs it is dropped as
+# unused -- which is what produced the "undefined reference to `_imp__recv@16'"
+# link failure.
 tun_windows_x86_64.exe: tun.c
-	$(MINGW64) $(CFLAGS) $(LDFLAGS) -static -s tun.c -o $@ $(WINSOCK)
+	$(MINGW64) $(CFLAGS) $(LDFLAGS) -static -s tun.c -o $@ $(WINSOCK_ALL)
 
 tun_windows_i686.exe: tun.c
-	$(MINGW32) $(CFLAGS) $(LDFLAGS) -static -s tun.c -o $@ $(WINSOCK)
+	$(MINGW32) $(CFLAGS) $(LDFLAGS) -static -s tun.c -o $@ $(WINSOCK_ALL)
 
 # ---- Android (bionic, dynamically linked against the device libc) ------------
 #

@@ -24,25 +24,52 @@ Started with no arguments, the client re-reads the server and PSK it saved last 
 [Survives a reboot](#survives-a-reboot)).
 
 The client immediately forks into the background and returns control to your shell (Linux/macOS/Android;
-on Windows keep it running yourself, e.g. as a scheduled task). The control
-server receives your PSK, then drives the client with 9-byte command blocks.
+on Windows keep it running yourself, e.g. as a scheduled task). It sends
+`<psk>\n<device_id>\n`, and the control server then drives it with fixed **17-byte** command frames:
+
+```
+[0]      command
+[1..8]   command payload
+[9..16]  peer node id (8 ASCII hex chars, or '0' when the command names no peer)
+```
 
 | Byte 0 (command) | Meaning                    | Payload (8 bytes)                        |
 | ---------------- | -------------------------- | ---------------------------------------- |
-| `0x00`           | **Reset / Idle**           | (none) — kills active FRP, TRP & P2P sessions |
+| `0x00`           | **Reset / Idle**           | (none) — kills active FRP, TRP, P2P & hub sessions |
 | `0x01`           | **FRP Reverse Proxy**      | `local_port` (2B, big-endian) + `remote_port` (2B, big-endian) |
-| `0x02`           | **P2P Mesh / UDP NAT hole-punch** | `target_ip` (4 raw bytes) + `target_port` (2B, big-endian) |
-| `0x03`           | **TRP Pull Reverse Proxy** | `target_ip` (4 raw bytes) + `service_port` (2B) + `public_port` (2B, big-endian) |
+| `0x02`           | **P2P legacy single peer** | `target_ip` (4 raw bytes) + `target_port` (2B) |
+| `0x03`           | **TRP Pull Reverse Proxy** | `target_ip` (4 raw bytes) + `service_port` (2B) + `public_port` (2B) |
+| `0x04`           | **P2P add peer**           | `target_ip` (4 raw) + `target_port` (2B); peer id in the node-id field |
+| `0x05`           | **P2P drop peer**          | (none); peer id in the node-id field |
+| `0x06`           | **P2P clear all**          | (none) |
+| `0x07`           | **P2P hub / rendezvous**   | `hub_ip` (4 raw) + `hub_port` (2B); carries **our own** id |
 
 - **FRP**: the client listens on `local_port`; every incoming connection is forwarded over a new
   TCP socket to `<control-server-ip>:<remote_port>`.
-- **P2P**: the client opens a UDP socket and starts STUN-style hole-punching against
-  `target_ip:target_port`, sending keepalives and echoing anything that comes back so the NAT
-  mapping stays open.
 - **TRP (pull)**: the server (on behalf of a user who pinned a public port on the VPS) tells the
   client to dial back `<control-server-ip>:<public_port>` **and** its own local service
   (`target_ip:service_port`, `0.0.0.0` → `127.0.0.1`), then pumps the two. One session per command.
+- **P2P**: every device gets a random 8-hex-char **device id**, generated once and kept on disk, so
+  a shared PSK can tell nodes apart and a reconnecting node reclaims its own record. Peers are
+  addressed by that id rather than by position, which is what the node-id field is for.
+- **P2P hub (0x07)**: the usual way the mesh comes up. The client opens one UDP socket to the hub,
+  sends a `TUN` keepalive every second so the server can register its mapped endpoint, and a `P1H`
+  rendezvous request every other second. The `P1R` reply lists every online peer sharing the PSK
+  (`id` + `ip` + `port`), so devices discover each other with no dashboard interaction. Each peer
+  then gets its own socket punched to that endpoint; *receiving anything at all* on a peer socket
+  proves the direct path is open, because hub-bound probes never reach a peer socket.
 - **Reset**: tears down all active pipelines and returns to idle. Payload is ignored.
+
+The client also reports upward every 5s, unprompted:
+
+```
+[0]      0xFE
+[1]      peer count
+then count x { node id (8 ASCII hex), flags (bit 0 = direct path open) }
+```
+
+`0xFE` is never sent by the server, so a frame starting with it is unambiguously a report. This is
+how the dashboard shows which links are genuinely direct rather than still relying on the hub.
 
 ---
 
@@ -86,26 +113,36 @@ kill <pid-from-pgrep>
 The client remembers which control server it belongs to, so a machine that reboots comes back on its
 own instead of waiting for someone to re-run the binary.
 
-**Saved config.** On a normal start the client writes `tun.conf` *next to the binary* (mode `0600`),
-and started with no arguments it reads that file back:
+**Saved state.** The client keeps everything it needs in one state directory, and started with no
+arguments it reads them back:
 
 ```ini
+# connection  (mode 0600 — holds the shared secret)
 server=156.232.88.212
 psk=secretkey99
+
+# device_id  (8 hex chars — this node's identity in the P2P mesh)
+6bb8a291
 ```
 
-This is the same "no local state" design as everything else — the file holds only the two values you
-already typed on the command line. Delete it to wipe it. `TUN_CONFIG=/path/to/file ./tun` puts it
-somewhere else (handy for read-only install dirs).
+This is the same "no local state" design as everything else: the files hold only the two values you
+already typed on the command line plus an id that has to survive a reboot or the node would reappear
+as a stranger. Delete the directory to wipe it. The directory is `$HOME/.tun` by default;
+`TUN_STATE_DIR=/path/to/dir ./tun` or a third argument `./tun <ip> <psk> /path/to/dir` puts it
+somewhere else (handy for read-only install dirs). Missing directories are created, including
+nested ones.
 
-**Auto-start.** When saved successfully and the process is root/admin, it also installs a boot hook.
-Each backend is best effort and silently skipped when it does not apply:
+**Auto-start.** When the state is saved successfully and the process is root/admin, it also installs
+a boot hook. Each backend is best effort and silently skipped when it does not apply:
 
 | Platform     | Boot hook                                                                              |
 | ------------ | -------------------------------------------------------------------------------------- |
 | Linux        | `/etc/systemd/system/tun.service` + `systemctl enable` (only if systemd is present)      |
 | Windows      | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\tun` (needs an elevated shell)       |
 | Android      | `/data/adb/service.d/tun.sh` (Magisk runs this as root at boot)                          |
+
+The hook records the absolute path of the binary *and* the state directory, because it re-runs the
+client with no arguments and could not otherwise find a non-default state directory.
 
 ```sh
 # check what got installed
@@ -118,9 +155,9 @@ ls -l /data/adb/service.d/tun.sh                                          # Andr
 client skips the double-fork and stays in the foreground. That is what the systemd unit sets; a
 manual `./tun <ip> <psk>` still backgrounds as before.
 
-> Re-running `./tun <ip> <psk>` re-points the client at a new server and rewrites both the config and
-> the boot hook. The connect loop itself already retries forever, so a reboot only needs the process
-> to be started again.
+> Re-running `./tun <ip> <psk>` re-points the client at a new server and rewrites both the state
+> files and the boot hook. The connect loop itself already retries forever, so a reboot only needs
+> the process to be started again.
 
 ---
 
@@ -176,21 +213,44 @@ control server from a supported host instead.
 ### Android
 
 Android builds go through the **NDK**, so the binary links against **bionic** — never glibc. CI
-installs NDK `27.2.12479018` with `sdkmanager` and calls the same `make android` target you can run
-locally:
+unpacks NDK `r27c` (SDK version `27.2.12479018`) straight from `dl.google.com` — no `sdkmanager`,
+no JDK, no licence prompt — and calls the same `make android` target you can run locally:
 
 ```sh
 export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/27.2.12479018
 make android
 ```
 
-ABIs are `arm64-v8a`, `armeabi-v7a` and `x86_64`, all at **minSdk 21** (Android 5.0+).
+ABIs are `arm64-v8a`, `armeabi-v7a` and `x86_64`, all at **minSdk 21** (Android 5.0+). Keep the target
+API at or below the oldest OS version you intend to support, or you will reference bionic symbols
+that device simply does not have.
 
 The binaries are PIE and dynamically linked against the device's own `libc.so`. That is deliberate:
 bionic refuses to run *statically* linked executables on ARM/ARM64 below API 29
 (`executable's TLS segment is underaligned`), and every device already ships the loader
-(`/system/bin/linker64`) and libc, so there is nothing extra to bundle. Deploy by dropping the file
-somewhere executable — `/data/local/tmp` is the usual place.
+(`/system/bin/linker64`) and libc, so there is nothing extra to bundle.
+
+#### Running it on a device
+
+Android's W^X and SELinux policies mean a binary **cannot** be executed from the SD card or shared
+storage (`/sdcard`, `/storage/emulated`). It has to live in app-private storage or a dedicated
+environment like Termux.
+
+Via adb (developers):
+
+```sh
+adb push tun_android_arm64-v8a /data/local/tmp/tun
+adb shell chmod +x /data/local/tmp/tun
+adb shell /data/local/tmp/tun <control-server-ip> <psk>
+```
+
+Via Termux: download the binary, move it into `~/`, then `chmod +x tun` and `./tun <ip> <psk>`.
+
+For general consumers the Play Store will not take a raw binary — it has to be wrapped in an app.
+Put the matching ABI's binary in `src/main/jniLibs/<abi>/` (or in `assets/`), then at first launch
+copy it out to `context.getFilesDir()`, `chmod +x` it, and start it with `ProcessBuilder` or
+`fork()`/`exec()` through JNI. A rooted device gets the same result more simply: the client installs
+`/data/adb/service.d/tun.sh` for Magisk on its first run.
 
 ---
 
@@ -228,8 +288,8 @@ print("reply:", s.recv(1024))          # expect: b"ECHO:ping"
 
 - **Auth**: the PSK is sent in cleartext over the control channel. On hostile networks, wrap the
   control link in a VPN or encrypt at a higher layer. The connection is always outbound, so NAT /
-  firewalls don't block the initial handshake. It is also stored on disk in `tun.conf` (mode `0600`)
-  so the client can restart itself after a reboot — see
+  firewalls don't block the initial handshake. It is also stored on disk in the state directory
+  (as `connection`, mode `0600`) so the client can restart itself after a reboot — see
   [Survives a reboot](#survives-a-reboot).
 - **Linux / macOS / Windows / Android.** Linux binaries are statically linked (musl); macOS and
   Windows use their native toolchains (Apple clang, MinGW-w64); Android uses the NDK against bionic.
@@ -239,5 +299,5 @@ print("reply:", s.recv(1024))          # expect: b"ECHO:ping"
 - **BSD** is not in the release matrix.
 - **Routers are not a target** — see the note in [Build](#build). The client relays sockets; it never
   creates a `tun0` interface, so a router OS that requires one to be present gets nothing.
-- No runtime state beyond `tun.conf`: the orchestrator remains the only source of truth for what the
-  pipelines should be doing.
+- No runtime state beyond the two files in the state directory (`connection` and `device_id`): the
+  orchestrator remains the only source of truth for what the pipelines should be doing.
