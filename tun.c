@@ -114,6 +114,13 @@ static unsigned long rand_seed(void)
  *   [4..5] target port  (big-endian)
  *   [6..7] unused
  *
+ * BYTE ORDER: ports are big-endian, and the address bytes are stored exactly
+ * as they sit on the wire (network order), because they are copied straight
+ * into sin_addr.s_addr. Read them with rd16()/rd_ip() rather than re-shifting
+ * them into a host-order integer: doing that by hand byte-swaps the address,
+ * so 127.0.0.1 becomes 1.0.0.127 and the client punches at a black hole while
+ * looking perfectly healthy.
+ *
  * Client -> server status report:
  *   [0]      0xFE
  *   [1]      peer count
@@ -125,6 +132,13 @@ static unsigned long rand_seed(void)
  *   'T','U','N' | node_id(8) | counter(1)                  keepalive probe
  *   'P','1','H' | node_id(8)                               rendezvous request
  *   'P','1','R' | count(1) | count x { node_id(8) | ip(4) | port(2) }
+ *
+ * The hub socket is deliberately NOT connect()ed. A connected UDP socket only
+ * accepts datagrams from its peer, which is the server relay — so the very
+ * punch that completes a direct path would be dropped by the kernel and no
+ * link could ever go direct. Using sendto/recvfrom keeps the NAT mapping open
+ * while letting a peer's punch land on the same socket; such a packet is what
+ * proves the path open, and is echoed back so both ends agree.
  */
 
 #define HUB_PROBE_MAGIC "TUN"
@@ -325,7 +339,9 @@ THREAD_FN(frp_session)
  *    anything else is echoed unchanged, preserving the original link semantics.
  *
  * Receiving a probe is itself the punch completing, so both sides mark
- * themselves direct from the same exchange and report it upward.
+ * themselves direct from the same exchange and report it upward. A punch can
+ * also land on the hub socket instead, which is why that socket is
+ * unconnected and echoes non-reply datagrams; see the protocol notes above.
  */
 
 struct p2p_peer {
@@ -497,6 +513,19 @@ static struct sockaddr_in g_hub_addr;
 static thread_t g_hub_thr;
 static int g_hub_ready = 0;
 
+/* Marks the link to a known peer as direct once that peer's punch has actually
+ * arrived, so the status reporter can carry the bit upward. */
+static void p2p_mark_direct_by_id(const char *id)
+{
+    int i;
+    if (!id || id[0] == '\0') return;
+    mutex_lock(&g_p2p_mu);
+    for (i = 0; i < P2P_MAX; i++) {
+        if (g_peers[i] && memcmp(g_peers[i]->id, id, ID_LEN) == 0) g_peers[i]->direct = 1;
+    }
+    mutex_unlock(&g_p2p_mu);
+}
+
 static void parse_rendezvous_reply(const unsigned char *buf, int n)
 {
     int off;
@@ -536,31 +565,54 @@ THREAD_FN(hub_thread)
     while (g_hub_running) {
         sock_t u = socket(AF_INET, SOCK_DGRAM, 0);
         if (u == INVALID_SOCKET) { SLEEP_MS(1000); continue; }
-        if (connect(u, (struct sockaddr *)&g_hub_addr, sizeof(g_hub_addr)) < 0) {
-            CLOSE_SOCK(u);
-            SLEEP_MS(2000);
-            continue;
-        }
+        /* Deliberately not connect()ed. A connected UDP socket only accepts
+         * datagrams from the relay, which is exactly the peer punch that
+         * completes the direct path — the kernel would drop it and the link
+         * could never go direct. sendto/recvfrom keeps the NAT mapping while
+         * letting a peer's punch land here. */
         struct timeval tv;
         tv.tv_sec = 0;
         tv.tv_usec = 500000;
         setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
         while (g_hub_running) {
+            struct sockaddr_in from;
+            socklen_t flen = sizeof(from);
             int n = 0;
 #ifndef _WIN32
             do {
-                n = recv(u, buf, (int)sizeof(buf), 0);
+                n = (int)recvfrom(u, buf, (int)sizeof(buf), 0,
+                                  (struct sockaddr *)&from, &flen);
             } while (n < 0 && errno == EINTR && g_hub_running);
 #else
-            n = recv(u, buf, (int)sizeof(buf), 0);
+            n = (int)recvfrom(u, buf, (int)sizeof(buf), 0,
+                              (struct sockaddr *)&from, &flen);
 #endif
-            /* The hub socket only ever acts on a discovery reply. */
-            if (n > 0) parse_rendezvous_reply(buf, n);
-            send(u, probe, (int)sizeof(probe), 0);
+            if (n > 0) {
+                if (n >= 4 && memcmp(buf, HUB_REPLY_MAGIC, 3) == 0) {
+                    parse_rendezvous_reply(buf, n);
+                } else {
+                    /* A peer punched at this socket: receiving anything proves
+                     * its path to us is open, so record it and echo the packet
+                     * back so the far end reaches the same conclusion. */
+                    char id[ID_LEN + 1];
+                    if (n >= 3 + ID_LEN) {
+                        memcpy(id, buf + 3, ID_LEN);
+                        id[ID_LEN] = '\0';
+                    } else {
+                        id[0] = '\0';
+                    }
+                    p2p_mark_direct_by_id(id);
+                    sendto(u, buf, n, 0, (struct sockaddr *)&from, sizeof(from));
+                }
+            }
+            sendto(u, probe, (int)sizeof(probe), 0,
+                   (struct sockaddr *)&g_hub_addr, sizeof(g_hub_addr));
             probe[3 + ID_LEN]++;
             /* Ask who else is out there every other second; a reply is the
              * automatic discovery of every other device on our PSK. */
-            if (tick % 2 == 0) send(u, hello, (int)sizeof(hello), 0);
+            if (tick % 2 == 0)
+                sendto(u, hello, (int)sizeof(hello), 0,
+                       (struct sockaddr *)&g_hub_addr, sizeof(g_hub_addr));
             tick++;
             SLEEP_MS(1000);
         }
@@ -995,10 +1047,16 @@ static void stop_session(int *running, thread_t *t, volatile int *stop)
 }
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
-static uint32_t rd32(const uint8_t *p)
+
+/* Reads a 4-byte IPv4 address out of a control payload and returns it in the
+ * network byte order that sin_addr.s_addr stores. The server writes the raw
+ * address bytes (Go's ip.To4()), so the conversion belongs here, in one place:
+ * leaving it to each call site is how 127.0.0.1 turns into 1.0.0.127 and every
+ * client ends up punching at a black hole. */
+static uint32_t rd_ip(const uint8_t *p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+    return htonl(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                 ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
 }
 
 static int frame_peer_id(const struct ControlPacket *pkt, char *out)
@@ -1036,15 +1094,15 @@ static void handle_command(struct ControlPacket *pkt, const char *server_ip)
         if (frame_peer_id(pkt, id)) {
             memcpy(g_node_id, id, ID_LEN);
             g_node_id[ID_LEN] = '\0';
-            hub_start(rd32(pkt->payload), rd16(pkt->payload + 4));
+            hub_start(rd_ip(pkt->payload), rd16(pkt->payload + 4));
         }
     } else if (pkt->command == CMD_P2P) {
         /* Legacy single-peer form: replaces whatever mesh was running. */
         p2p_clear();
         id[0] = '\0';
-        p2p_start("", rd32(pkt->payload), rd16(pkt->payload + 4));
+        p2p_start("", rd_ip(pkt->payload), rd16(pkt->payload + 4));
     } else if (pkt->command == CMD_P2P_ADD) {
-        if (frame_peer_id(pkt, id)) p2p_start(id, rd32(pkt->payload), rd16(pkt->payload + 4));
+        if (frame_peer_id(pkt, id)) p2p_start(id, rd_ip(pkt->payload), rd16(pkt->payload + 4));
     } else if (pkt->command == CMD_P2P_DEL) {
         if (frame_peer_id(pkt, id)) p2p_stop(id);
     } else if (pkt->command == CMD_P2P_CLR) {
@@ -1052,7 +1110,7 @@ static void handle_command(struct ControlPacket *pkt, const char *server_ip)
     } else if (pkt->command == CMD_HUB_STOP) {
         hub_stop();
     } else if (pkt->command == CMD_TRP) {
-        uint32_t target_ip = rd32(pkt->payload);
+        uint32_t target_ip = rd_ip(pkt->payload);
         uint16_t service_port = rd16(pkt->payload + 4);
         uint16_t public_port = rd16(pkt->payload + 6);
         g_trp_stop = 0;
@@ -1105,7 +1163,11 @@ int main(int argc, char *argv[])
 
     mutex_init(&g_p2p_mu);
     mutex_init(&g_ctrl_mu);
+    /* Both gates must be open before the first frame is handled: a command can
+     * arrive before this point on a fast server, and dropping it would leave
+     * the client permanently without a rendezvous socket. */
     g_p2p_ready = 1;
+    g_hub_ready = 1;
     if (load_or_make_device_id(state, device_id, sizeof(device_id)) != 0) {
         random_hex(device_id, ID_LEN / 2);
     }

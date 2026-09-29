@@ -43,6 +43,13 @@ on Windows keep it running yourself, e.g. as a scheduled task). It sends
 | `0x05`           | **P2P drop peer**          | (none); peer id in the node-id field |
 | `0x06`           | **P2P clear all**          | (none) |
 | `0x07`           | **P2P hub / rendezvous**   | `hub_ip` (4 raw) + `hub_port` (2B); carries **our own** id |
+| `0x08`           | **Stop hub**               | (none) — drops the rendezvous socket, keeps the node online |
+
+**Byte order.** Ports in a payload are big-endian. The four address bytes are already in network
+order and are copied straight into `sin_addr.s_addr` — the client never re-orders them. This matters
+because the same convention applies to the hub datagrams, where a byte-swapped `127.0.0.1` becomes
+`1.0.0.127` and the client keeps probing a black hole while looking perfectly healthy on the
+dashboard.
 
 - **FRP**: the client listens on `local_port`; every incoming connection is forwarded over a new
   TCP socket to `<control-server-ip>:<remote_port>`.
@@ -58,6 +65,11 @@ on Windows keep it running yourself, e.g. as a scheduled task). It sends
   (`id` + `ip` + `port`), so devices discover each other with no dashboard interaction. Each peer
   then gets its own socket punched to that endpoint; *receiving anything at all* on a peer socket
   proves the direct path is open, because hub-bound probes never reach a peer socket.
+  The hub socket is intentionally **not** `connect()`ed to the server: a connected UDP socket only
+  accepts datagrams from its own peer, so the kernel would silently drop a peer's punch arriving
+  there and the link could never go direct. It uses `sendto`/`recvfrom` instead, which keeps the NAT
+  mapping open while letting a punch land, echoes that packet back so both ends reach the same
+  conclusion, and reports the link as direct.
 - **Reset**: tears down all active pipelines and returns to idle. Payload is ignored.
 
 The client also reports upward every 5s, unprompted:
@@ -168,7 +180,8 @@ manual `./tun <ip> <psk>` still backgrounds as before.
 | Control link | One outbound TCP connection from the node to `server:7000`. |
 | FRP session | Node listens on `local_port` (check `ss -tlnp \| grep tun`). |
 | P2P session | Node holds a UDP socket; constant keepalive traffic to the target. |
-| After Reset  | All listeners/sockets from FRP and P2P are gone; node back to idle. |
+| P2P hub | One UDP socket registered with `server:7001`; a `direct` link on the dashboard means the punch completed. |
+| After Reset  | All listeners/sockets from FRP, TRP, P2P and the hub are gone; node back to idle. |
 
 Toggling is seamless: sending a new `0x01`/`0x02` replaces the previous FRP or P2P session
 automatically, and a `0x00` always stops everything.
@@ -259,7 +272,7 @@ copy it out to `context.getFilesDir()`, `chmod +x` it, and start it with `Proces
 Simulate a control server, an echo service, and drive the client — no real network needed:
 
 ```python
-import socket, struct, threading, time, subprocess
+import os, socket, struct, threading, time, subprocess
 
 def serve_echo():
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -268,19 +281,29 @@ def serve_echo():
 
 threading.Thread(target=serve_echo, daemon=True).start()
 
-proc = subprocess.Popen(["./tun", "127.0.0.1", "secretkey99"])
+# TUN_FOREGROUND=1 keeps the client in the foreground so this script owns it
+# and can kill it; without it the client double-forks into a daemon.
+proc = subprocess.Popen(["./tun", "127.0.0.1", "secretkey99"],
+                        env={**os.environ, "TUN_FOREGROUND": "1"})
 
 ctrl = socket.socket(); ctrl.bind(("127.0.0.1", 7000)); ctrl.listen(1)
 conn, _ = ctrl.accept()
 print("psk received:", conn.recv(64))
-# FRP: local port 9000 -> server port 9001
-conn.sendall(struct.pack("B", 0x01) + struct.pack(">H", 9000) + struct.pack(">H", 9001) + b"\x00\x00\x00\x00")
+# FRP: local port 9000 -> server port 9001. The payload is 8 bytes (two
+# big-endian ports + 4 unused), then the 8-byte node-id field, which is '0'
+# padding for commands that name no peer: 1 + 8 + 8 = 17 bytes total.
+conn.sendall(struct.pack("B", 0x01) + struct.pack(">H", 9000) + struct.pack(">H", 9001)
+             + b"\x00" * 4 + b"0" * 8)
 
 time.sleep(1)
 s = socket.create_connection(("127.0.0.1", 9000), timeout=5)
 s.sendall(b"ping")
 print("reply:", s.recv(1024))          # expect: b"ECHO:ping"
 ```
+
+**Note the frame length.** A control frame is exactly 17 bytes: 1 command + 8 payload + 8 node-id.
+Sending only the 10 payload bytes desynchronizes the stream, and the client will read your next
+command shifted by seven bytes — which usually looks like a client that ignores the dashboard.
 
 ---
 
