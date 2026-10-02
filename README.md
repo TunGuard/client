@@ -83,6 +83,34 @@ then count x { node id (8 ASCII hex), flags (bit 0 = direct path open) }
 `0xFE` is never sent by the server, so a frame starting with it is unambiguously a report. This is
 how the dashboard shows which links are genuinely direct rather than still relying on the hub.
 
+**The report is also the client's heartbeat, so it goes out unconditionally — including with a peer
+count of `0`.** A control channel carries commands downward and nothing else upward, so a node whose
+mesh is empty would otherwise go completely silent and sit on an idle socket forever. Every NAT, load
+balancer and proxy-read-timeout in the path would eventually decide that connection was dead and drop
+it without telling either end. An empty `0xFE` report is enough to keep the path warm, and the server
+refreshes a node's liveness as soon as it sees the leading `0xFE`, before it looks at the count, so an
+empty one costs nothing and is entirely valid on the wire.
+
+**Staying connected.** Because nothing about a quiet socket distinguishes "the server has nothing to
+say" from "the path is gone", the client also:
+
+- **ignores `SIGPIPE`.** Writing to a control socket the server has just closed should never terminate
+  the process. Every network daemon does this; it costs nothing and turns a would-be fatal signal into
+  an ordinary write error the reconnect loop already handles.
+- **bounds how long the link may be silent.** `TCP_USER_TIMEOUT` of 30s aborts the connection once
+  data has gone unacknowledged for that long, so a path a NAT or load balancer dropped without a FIN
+  is dropped by the client itself in roughly 35s instead of leaving the node sitting there looking
+  online. `SO_KEEPALIVE` (20s idle, 5s interval, 3 probes) is set as well, for the case where the
+  socket really is idle. Note that keepalive *alone* cannot do this job here: it only probes an idle
+  connection, and the 5s heartbeat means there is normally unacked data queued, so the probes would
+  never be armed. macOS has no `TCP_USER_TIMEOUT` and relies on the normal retransmission timeout
+  there.
+- **never parks forever on a write.** The control socket has a 5s send timeout, so a peer that stops
+  reading cannot pin the status reporter inside `send()` while it holds the lock the main thread needs
+  in order to reconnect.
+
+Any of the three failing means the link is torn down and the client reconnects on its own.
+
 ---
 
 ## Is it running?
@@ -106,7 +134,8 @@ netstat -tnp | grep tun
 The `ESTABLISHED` socket show the client is currently connected to the control server. **Note:**
 if the control link drops, the client reconnects on its own every ~2s and every ~5s while the
 server is unreachable — the process stays alive either way, so `pgrep` is the reliable health
-check.
+check. A link that dies without a FIN (a NAT or load balancer reclaiming an idle flow) is torn down
+by the client itself in ~35s and reconnected the same way; a clean close is noticed immediately.
 
 To stop it:
 

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <errno.h>
 
+#ifndef _WIN32
+#include <signal.h>
+#endif
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -40,6 +44,7 @@ static unsigned long rand_seed(void) { return (unsigned long)GetTickCount() ^ (u
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -70,6 +75,130 @@ static unsigned long rand_seed(void)
     return (unsigned long)tv.tv_sec ^ ((unsigned long)tv.tv_usec << 8) ^ (unsigned long)getpid();
 }
 #endif
+
+/* Liveness tuning for the control link. A control channel carries commands
+ * downward and nothing upward, so nothing about an idle socket distinguishes
+ * "the server is quiet" from "the path is gone". These bound that ambiguity:
+ * probe the link well inside any middlebox idle timeout, and never let a write
+ * park forever on a socket whose far end has stopped reading. */
+#define KEEPALIVE_IDLE_S     20
+#define KEEPALIVE_INTVL_S    5
+#define KEEPALIVE_PROBES     3
+#define CTRL_SEND_TIMEOUT_MS 5000
+/* How long data may sit unacknowledged before the kernel gives up on the
+ * control link. This, not keepalive, is what actually detects a silently
+ * dropped path here -- see tune_control_socket(). */
+#define CTRL_USER_TIMEOUT_MS 30000
+
+/* SO_RCVTIMEO/SO_SNDTIMEO take a DWORD of milliseconds on Windows but a
+ * struct timeval everywhere else. Handing Windows the struct makes it read
+ * tv_sec as the timeout, which is 0 here, and a 0 timeout means "block
+ * forever" -- so every timed recv below would park forever and each
+ * thread_join waiting on it would hang. This is the one place that knows the
+ * difference. */
+static void set_io_timeout(sock_t fd, int opt, int ms)
+{
+#ifdef _WIN32
+    DWORD t = (DWORD)ms;
+    setsockopt(fd, SOL_SOCKET, opt, (const char *)&t, sizeof(t));
+#else
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, opt, (const char *)&tv, sizeof(tv));
+#endif
+}
+
+/* Makes the control socket notice a dead path instead of sitting on it. The
+ * main thread parks in recv() waiting for commands, so without this a link
+ * dropped in silence by a NAT or load balancer is never detected: the process
+ * stays alive, the socket looks fine locally, and the node simply stops
+ * appearing on the server.
+ *
+ * Keepalive alone does NOT do it, which is worth stating because it is the
+ * obvious thing to reach for. TCP keepalive only probes a connection that has
+ * gone *idle*, and the status heartbeat means there is almost always
+ * unacknowledged data queued -- the socket never goes idle, so the probes are
+ * never armed. That was measured on a link dropped with iptables: 70s of
+ * bytes_sent climbing against bytes_acked frozen at the handshake, with no
+ * keepalive timer on the socket at all.
+ *
+ * TCP_USER_TIMEOUT is the setting that does work, precisely because it bounds
+ * how long data may sit unacknowledged instead of waiting for idleness. It
+ * costs nothing on a healthy link, where acknowledgements arrive at once.
+ * Keepalive is kept as well, so a genuinely idle link is still probed. Absent
+ * on macOS, where the retransmission timeout remains the backstop. */
+static void tune_control_socket(sock_t fd)
+{
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&one, sizeof(one));
+#ifdef _WIN32
+    {
+        /* Windows has no TCP_KEEPIDLE: the idle time and probe count travel in
+         * the SIO_KEEPALIVE_VALS control code instead. The extended struct is
+         * this file's own because mingw's mstcpip.h omits retrycount even
+         * though MSVC's has it; the layout matches, and the control code reads
+         * only the fields the running OS knows about. */
+        struct tcp_keepalive_v {
+            unsigned long onoff;
+            unsigned long keepalivetime;
+            unsigned long keepaliveinterval;
+            unsigned long retrycount;
+        } keep;
+        DWORD out = 0;
+        memset(&keep, 0, sizeof(keep));
+        keep.onoff = 1;
+        keep.keepalivetime = KEEPALIVE_IDLE_S;
+        keep.keepaliveinterval = KEEPALIVE_INTVL_S;
+        keep.retrycount = KEEPALIVE_PROBES;
+        WSAIoctl(fd, SIO_KEEPALIVE_VALS, &keep, sizeof(keep),
+                 NULL, 0, &out, NULL, NULL);
+    }
+#elif defined(TCP_KEEPIDLE)
+    {
+        /* Linux/Android. The probe count is spelled TCP_KEEPCNT here: the
+         * kernel constant is TCP_KEEPALIVE, but glibc and bionic both publish
+         * it under the KEEPCNT name, so reaching for TCP_KEEPALIVE here would
+         * simply fail to compile. */
+        int idle = KEEPALIVE_IDLE_S;
+        int intvl = KEEPALIVE_INTVL_S;
+        int cnt = KEEPALIVE_PROBES;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (const char *)&idle, sizeof(idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (const char *)&intvl, sizeof(intvl));
+#ifdef TCP_KEEPCNT
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, (const char *)&cnt, sizeof(cnt));
+#else
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, (const char *)&cnt, sizeof(cnt));
+#endif
+    }
+#elif defined(TCP_KEEPALIVE)
+    {
+        /* macOS/BSD, where TCP_KEEPALIVE is the idle time in seconds. */
+        int secs = KEEPALIVE_IDLE_S;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, (const char *)&secs, sizeof(secs));
+    }
+#endif
+    /* A stalled peer must not be able to pin the status reporter inside send()
+     * forever: it holds the control lock while it writes, and the main thread
+     * joins that reporter before reconnecting, so a blocked write here wedges
+     * the whole client. */
+    set_io_timeout(fd, SO_SNDTIMEO, CTRL_SEND_TIMEOUT_MS);
+
+#ifdef TCP_USER_TIMEOUT
+    {
+        int ms = CTRL_USER_TIMEOUT_MS;
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, (const char *)&ms, sizeof(ms));
+    }
+#elif defined(_WIN32)
+    {
+        /* Windows has supported this option since Vista, but mingw does not
+         * publish the name, so spell out the value. 18 is fixed by the
+         * protocol and is the same number Linux uses. */
+        DWORD ms = CTRL_USER_TIMEOUT_MS;
+        setsockopt(fd, IPPROTO_TCP, 18, (const char *)&ms, sizeof(ms));
+    }
+#endif
+}
 
 #define CMD_RESET    0x00
 #define CMD_FRP      0x01
@@ -198,14 +327,21 @@ static int read_full(sock_t fd, void *buf, size_t len)
     return 0;
 }
 
-static void write_full(sock_t fd, const void *buf, size_t len)
+/* Writes the whole buffer or reports the link as broken. Returning rather than
+ * looping on a wedged socket is the point: the caller can tear the connection
+ * down and reconnect, which a permanently blocked send() can never do. */
+static int write_full(sock_t fd, const void *buf, size_t len)
 {
     size_t off = 0;
     while (off < len) {
         int n = send(fd, (const char *)buf + off, (int)(len - off), 0);
-        if (n <= 0) return;
+#ifndef _WIN32
+        if (n < 0 && errno == EINTR) continue;
+#endif
+        if (n <= 0) return -1;
         off += (size_t)n;
     }
+    return 0;
 }
 
 static void pump(sock_t a, sock_t b, const volatile int *stop)
@@ -372,10 +508,9 @@ THREAD_FN(p2p_thread)
             SLEEP_MS(2000);
             continue;
         }
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
-        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+        /* Must actually time out: this thread is joined by p2p_stop, so a recv
+         * that parks forever turns every stop/reset into a permanent hang. */
+        set_io_timeout(u, SO_RCVTIMEO, 500);
         while (p->running) {
             int n = 0;
 #ifndef _WIN32
@@ -570,10 +705,10 @@ THREAD_FN(hub_thread)
          * completes the direct path — the kernel would drop it and the link
          * could never go direct. sendto/recvfrom keeps the NAT mapping while
          * letting a peer's punch land here. */
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
-        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+        /* Must actually time out: hub_stop() joins this thread, so a recv that
+         * parks forever turns CMD_HUB_STOP and CMD_RESET into a permanent
+         * hang in the main loop. */
+        set_io_timeout(u, SO_RCVTIMEO, 500);
         while (g_hub_running) {
             struct sockaddr_in from;
             socklen_t flen = sizeof(from);
@@ -696,7 +831,14 @@ THREAD_FN(trp_session)
 /* ---- Status reporting ----------------------------------------------------- */
 
 /* One report is [0xFE][count][ (node id:8, flags:1) * count ]. It is how the
- * dashboard shows which links are direct rather than still relying on the hub. */
+ * dashboard shows which links are direct rather than still relying on the hub,
+ * and — because it is the only thing this client ever sends upward — it is
+ * also the control link's heartbeat. It therefore goes out unconditionally,
+ * including with count 0: a node whose mesh is empty would otherwise go
+ * completely silent, and every NAT, load balancer and idle-timeout in the path
+ * would eventually drop a socket that carries no traffic. The server reads a
+ * 0xFE report before it looks at the count, so an empty one still refreshes
+ * liveness. */
 THREAD_FN(status_thread)
 {
     unsigned char report[2 + P2P_MAX * (ID_LEN + 1)];
@@ -719,10 +861,19 @@ THREAD_FN(status_thread)
             n++;
         }
         mutex_unlock(&g_p2p_mu);
-        if (n > 0) {
-            report[0] = STATUS_BYTE;
-            report[1] = (unsigned char)n;
-            write_full(fd, report, (size_t)(2 + n * (ID_LEN + 1)));
+        report[0] = STATUS_BYTE;
+        report[1] = (unsigned char)n;
+        if (write_full(fd, report, (size_t)(2 + n * (ID_LEN + 1))) != 0) {
+            /* The link is gone and only the main thread reconnects. Shut it
+             * down so the recv_full it is parked in returns at once, rather
+             * than leaving it blocked until some unrelated read timeout. */
+#ifdef _WIN32
+            shutdown(fd, SD_BOTH);
+#else
+            shutdown(fd, SHUT_RDWR);
+#endif
+            mutex_unlock(&g_ctrl_mu);
+            break;
         }
         mutex_unlock(&g_ctrl_mu);
     }
@@ -1178,6 +1329,15 @@ int main(int argc, char *argv[])
 
 #ifndef _WIN32
     {
+        /* Writing to a control socket the server has just closed must not kill
+         * this process: SIGPIPE's default action is to terminate, so every
+         * server restart would take the client down with it. Under systemd
+         * that gets papered over by Restart=always, but the Android and
+         * Windows boot hooks run the client unsupervised, where it meant the
+         * client died for good and never came back on its own. Ignoring the
+         * signal turns the failure into an EPIPE that write_full reports, so
+         * the reconnect loop runs as intended. */
+        signal(SIGPIPE, SIG_IGN);
         /* A boot hook supervises us directly, so it needs us in the foreground. */
         const char *fg = getenv("TUN_FOREGROUND");
         if (!(fg && *fg && strcmp(fg, "0") != 0)) daemonize();
@@ -1199,15 +1359,24 @@ int main(int argc, char *argv[])
             SLEEP_MS(5000);
             continue;
         }
+        tune_control_socket(control_fd);
         /* "<psk>\n<device_id>\n" — the id is what makes a shared PSK usable
-         * with more than one device. */
-        if (send(control_fd, psk, (int)strlen(psk), 0) <= 0 ||
-            send(control_fd, "\n", 1, 0) <= 0 ||
-            send(control_fd, device_id, (int)strlen(device_id), 0) <= 0 ||
-            send(control_fd, "\n", 1, 0) <= 0) {
-            CLOSE_SOCK(control_fd);
-            SLEEP_MS(2000);
-            continue;
+         * with more than one device. Assembled first and written as one buffer:
+         * four separate send() calls can each come up short, and a PSK cut in
+         * half fails authentication, so the reconnect quietly never lands. */
+        {
+            char hello[PATH_MAX_LEN * 2 + ID_LEN + 4];
+            int len = snprintf(hello, sizeof(hello), "%s\n%s\n", psk, device_id);
+            if (len <= 0 || (size_t)len >= sizeof(hello)) {
+                CLOSE_SOCK(control_fd);
+                SLEEP_MS(2000);
+                continue;
+            }
+            if (write_full(control_fd, hello, (size_t)len) != 0) {
+                CLOSE_SOCK(control_fd);
+                SLEEP_MS(2000);
+                continue;
+            }
         }
 
         mutex_lock(&g_ctrl_mu);
