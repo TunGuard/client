@@ -74,6 +74,14 @@ tun_android_armeabi-v7a: tun.c
 tun_android_x86_64: tun.c
 	$(ANDROID_CC_x86_64) $(ANDROID_CFLAGS) $(ANDROID_LDFLAGS) -pthread tun.c -o $@
 
+# ---- tests -------------------------------------------------------------------
+
+# Exercises the P2P link against a fake peer over loopback. It includes tun.c
+# directly, so it is built here and never shipped in a release.
+test: tests/link_test.c tun.c
+	$(CC) $(CFLAGS) -Wall -pthread tests/link_test.c -o tests/link_test
+	./tests/link_test
+
 # ---- aggregates --------------------------------------------------------------
 
 linux: tun_linux_x86_64 tun_linux_arm64
@@ -87,6 +95,6 @@ android: tun_android_arm64-v8a tun_android_armeabi-v7a tun_android_x86_64
 release: linux windows macos android
 
 clean:
-	rm -f tun tun_linux_* tun_macos_* tun_windows_*.exe tun_android_*
+	rm -f tun tun_linux_* tun_macos_* tun_windows_*.exe tun_android_* tests/link_test
 
-.PHONY: all linux macos windows android release clean
+.PHONY: all linux macos windows android release clean test

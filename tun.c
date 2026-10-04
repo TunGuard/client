@@ -43,6 +43,7 @@ static unsigned long rand_seed(void) { return (unsigned long)GetTickCount() ^ (u
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -75,6 +76,34 @@ static unsigned long rand_seed(void)
     return (unsigned long)tv.tv_sec ^ ((unsigned long)tv.tv_usec << 8) ^ (unsigned long)getpid();
 }
 #endif
+
+/* Monotonic milliseconds, for measuring a round trip. Wall-clock time is the
+ * wrong tool: an NTP step between sending a test and seeing its echo would
+ * report a negative or wildly inflated latency. Windows gets the 64-bit tick
+ * count so the counter cannot wrap in a long-lived process. */
+static unsigned long long now_ms(void)
+{
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (unsigned long long)ts.tv_sec * 1000ULL +
+           (unsigned long long)(ts.tv_nsec / 1000000L);
+#endif
+}
+
+/* Milliseconds between two readings of now_ms(), saturating at zero.
+ *
+ * Every timer below compares a clock reading taken at the top of a pass with a
+ * stamp written in an earlier pass, and the two are read microseconds apart, so
+ * "the stamp is newer than the reading" is a stale reading rather than an
+ * impossible one. Subtracting those unsigned would wrap to ~2^64 and expire
+ * every timer at once, which is exactly what a wrapped value does. */
+static unsigned long long ms_since(unsigned long long now, unsigned long long then)
+{
+    return now > then ? now - then : 0;
+}
 
 /* Liveness tuning for the control link. A control channel carries commands
  * downward and nothing upward, so nothing about an idle socket distinguishes
@@ -273,6 +302,66 @@ static void tune_control_socket(sock_t fd)
 #define HUB_PROBE_MAGIC "TUN"
 #define HUB_HELLO_MAGIC "P1H"
 #define HUB_REPLY_MAGIC "P1R"
+#define P2P_TEST_MAGIC  "P1T"
+
+/* Peer link test, sent on the direct (peer-to-peer) socket once a link is up:
+ *   'P','1','T' | node_id(8) | seq(1)
+ *
+ * A link that reports itself "direct" only proves packets can travel one way at
+ * the moment a punch landed, which is also true of a path the far end has
+ * since lost. This is an explicit round trip: the sequence number is ours, the
+ * far end echoes the packet back untouched (it already echoes everything it
+ * receives), and only that echo is treated as proof the peer can talk to us
+ * right now. The round trip is timed so the dashboard can show a real latency
+ * instead of a boolean.
+ *
+ * The magic keeps a test apart from the periodic punch probe, so a probe echo
+ * can never be mistaken for a completed test, and vice versa.
+ */
+#define P2P_TEST_SIZE (3 + ID_LEN + 1)
+
+/* Status report flag bits. Every one is additive inside the single flags byte,
+ * so a client and a server from different releases still read each other's
+ * reports: bit 0 is the one the dashboard used before link tests existed. */
+#define P2P_FLAG_DIRECT  0x01  /* a punch landed and the peer answered     */
+#define P2P_FLAG_TESTED  0x02  /* a link test completed since the last report */
+#define P2P_FLAG_RTT_SHIFT 2    /* round trip, in 4 bits of buckets        */
+#define P2P_FLAG_RTT_MASK  0x0F
+
+/* Four bits are all there is for a latency, so the value is bucketed rather
+ * than measured: fine where it matters (a direct path is single-digit
+ * milliseconds), coarse only where nobody is looking. Index 0 means "no test
+ * result yet", which is what a client too old to test reports forever. */
+#define RTT_UNKNOWN_BUCKET 0x00
+#define RTT_BUCKET_1_MS    0x01   /* <= 1ms   */
+#define RTT_BUCKET_4_MS    0x02   /* <= 4ms   */
+#define RTT_BUCKET_16_MS   0x03   /* <= 16ms  */
+#define RTT_BUCKET_64_MS   0x04   /* <= 64ms  */
+#define RTT_BUCKET_256_MS  0x05   /* <= 256ms */
+#define RTT_BUCKET_1S      0x06   /* <= 1s    */
+#define RTT_BUCKET_4S      0x07   /* <= 4s    */
+#define RTT_BUCKET_16S     0x08   /* <= 16s   */
+#define RTT_MAX_BUCKET     0x09
+
+/* Upper bound in milliseconds of each bucket, so a report can name the bucket
+ * it measured and a server can show the same figure without keeping the
+ * client's raw timing. */
+static const unsigned int g_rtt_bucket_ms[RTT_MAX_BUCKET + 1] = {
+    0, 1, 4, 16, 64, 256, 1000, 4000, 16000, 60000
+};
+
+/* How often to test a link that is already up, and how long a result stays
+ * fresh. Testing every few seconds keeps a dropped link visible within one
+ * reporting cycle instead of waiting for the next NAT timeout. The timeout has
+ * to stay below the interval, or a dead link would look verified for a whole
+ * cycle. */
+#define LINK_TEST_INTERVAL_MS 3000
+#define LINK_TEST_TIMEOUT_MS  2000
+
+/* How often a live peer socket re-sends its punch probe. Now driven by elapsed
+ * time rather than by loop iterations, so it holds its cadence however often the
+ * loop happens to wake to drain traffic. */
+#define PROBE_INTERVAL_MS 1000
 
 struct ControlPacket {
     uint8_t command;
@@ -289,6 +378,11 @@ static volatile int g_trp_stop = 0;
 static mutex_t g_p2p_mu;
 static struct p2p_peer *g_peers[P2P_MAX];
 static int g_p2p_ready = 0;
+
+/* Our own node id, as handed back by the server in CMD_P2P_HUB and seeded from
+ * the persisted device id before that. Declared here rather than beside the
+ * rendezvous hub because the per-peer link test needs it too. */
+static char g_node_id[ID_LEN + 1];
 
 /* The control socket is owned by the main thread; the status reporter writes
  * to it from its own thread, so the descriptor and its writes are guarded. */
@@ -471,8 +565,9 @@ THREAD_FN(frp_session)
  *    observed endpoint, so the packet it sends opens the mapping the peer is
  *    already aiming at. Receiving anything at all on this socket proves the
  *    direct path is open, because a hub-bound probe never reaches a peer
- *    socket. Probes are echoed so both ends converge on the same conclusion;
- *    anything else is echoed unchanged, preserving the original link semantics.
+ *    socket. Probes and link tests are echoed so both ends converge on the same
+ *    conclusion; a peer socket carries nothing else, so nothing else is echoed.
+ *    See p2p_echo_wanted() for why "echo everything" was the wrong rule.
  *
  * Receiving a probe is itself the punch completing, so both sides mark
  * themselves direct from the same exchange and report it upward. A punch can
@@ -485,17 +580,108 @@ struct p2p_peer {
     struct sockaddr_in target;
     volatile int running;
     volatile int direct;
+    /* Link test result for this peer. tested is a fact about the last test
+     * attempt, not a latch: a test that gets no echo clears it, so a link that
+     * dies between two tests stops claiming to be verified. */
+    volatile int tested;
+    volatile unsigned char rtt_bucket;
+    unsigned char test_seq;
+    unsigned char test_pending;      /* a test is outstanding and awaiting its echo */
+    unsigned long long test_sent_ms;
     thread_t thr;
 };
+
+/* Buckets a measured round trip. Deliberately not linear: a link test exists to
+ * answer "can these two devices actually talk", and that question is settled in
+ * the first few milliseconds. Everything above a second is only ever reported
+ * as "very slow", so the buckets spend their resolution where the answer is. */
+static unsigned char rtt_bucket_of(unsigned long long rtt_ms)
+{
+    unsigned char i;
+    for (i = RTT_BUCKET_1_MS; i <= RTT_MAX_BUCKET; i++)
+        if (rtt_ms <= (unsigned long long)g_rtt_bucket_ms[i]) return i;
+    return RTT_MAX_BUCKET;
+}
+
+/* Records the result of the outstanding test, if the packet just received is
+ * its echo. A test packet carries our node id and a sequence number, and the
+ * peer echoes it back byte for byte, so matching the sequence is what proves
+ * the peer received *this* test and answered it. Anything else on the socket --
+ * the punch probe, application traffic, a late echo of an older test -- leaves
+ * the result alone. */
+static void p2p_record_test_echo(struct p2p_peer *p, const unsigned char *buf, int n)
+{
+    unsigned long long sent;
+    unsigned long long rtt;
+    if (n != P2P_TEST_SIZE) return;
+    if (memcmp(buf, P2P_TEST_MAGIC, 3) != 0) return;
+    if (memcmp(buf + 3, g_node_id, ID_LEN) != 0) return;  /* not our test */
+    if (!p->test_pending) return;                          /* no test outstanding */
+    if (buf[3 + ID_LEN] != p->test_seq) return;           /* a stale echo */
+    sent = p->test_sent_ms;
+    p->test_pending = 0;
+    rtt = now_ms() - sent;
+    p->rtt_bucket = rtt_bucket_of(rtt);
+    p->tested = 1;
+}
+
+/* Decides whether a datagram arriving on a peer socket should be echoed back,
+ * and marks it as echoed.
+ *
+ * A peer socket used to echo everything it received. Both ends do that, so a
+ * link that was supposed to go quiet between punches never did: each side
+ * echoed the other's echo, forever, at round-trip rate -- and the backlog of
+ * that storm is what a link test has to be read out of.
+ *
+ * Echoing is still how each end learns the path is open, so it stays, but only
+ * for the two datagrams that expect an answer -- the punch probe and the link
+ * test -- and only the first time a given sequence number is seen. The second
+ * copy of a sequence is by definition our own echo coming back, so ignoring it
+ * is what ends the loop. Sequence numbers are one byte and wrap, which can let
+ * one stale packet be echoed an extra time; that costs a single packet and the
+ * loop still terminates.
+ *
+ * Probes and tests are tracked separately because both count from 1: sharing
+ * one marker would make a probe and a test look like repeats of each other.
+ */
+#define ECHO_KIND_PROBE 0
+#define ECHO_KIND_TEST  1
+
+static int p2p_echo_wanted(int *seen, unsigned char *seq_out,
+                           const unsigned char *buf, int n)
+{
+    int kind;
+    unsigned char seq;
+    if (n < P2P_TEST_SIZE) return 0;   /* too short to carry a sequence */
+    if (memcmp(buf, HUB_PROBE_MAGIC, 3) == 0) {
+        kind = ECHO_KIND_PROBE;
+    } else if (memcmp(buf, P2P_TEST_MAGIC, 3) == 0) {
+        kind = ECHO_KIND_TEST;
+    } else {
+        return 0;                      /* traffic for the peer, not for us */
+    }
+    seq = buf[3 + ID_LEN];
+    if (seen[kind] && seq == seq_out[kind]) return 0;
+    seen[kind] = 1;
+    seq_out[kind] = seq;
+    return 1;
+}
 
 THREAD_FN(p2p_thread)
 {
     struct p2p_peer *p = (struct p2p_peer *)arg;
     unsigned char probe[3 + ID_LEN + 1];
+    unsigned char test[P2P_TEST_SIZE];
     unsigned char buf[2048];
+    unsigned char echoed[2] = {0, 0};
+    int echoed_seen[2] = {0, 0};
+    unsigned long long last_probe = 0;
+    unsigned long long last_test = 0;
     memcpy(probe, HUB_PROBE_MAGIC, 3);
     memcpy(probe + 3, p->id, ID_LEN);
     probe[3 + ID_LEN] = 0x00;
+    memcpy(test, P2P_TEST_MAGIC, 3);
+    memcpy(test + 3, g_node_id, ID_LEN);
 
     /* Retries for as long as the slot is live: a peer that is not reachable
      * yet (its NAT has not been punched) is the normal case, not a failure.
@@ -509,26 +695,75 @@ THREAD_FN(p2p_thread)
             continue;
         }
         /* Must actually time out: this thread is joined by p2p_stop, so a recv
-         * that parks forever turns every stop/reset into a permanent hang. */
-        set_io_timeout(u, SO_RCVTIMEO, 500);
+         * that parks forever turns every stop/reset into a permanent hang. Short,
+         * because the whole loop wakes on it: everything queued is drained each
+         * pass, so a peer whose probes arrive faster than this thread used to
+         * wake cannot build a backlog that delays its link test. */
+        set_io_timeout(u, SO_RCVTIMEO, 100);
         while (p->running) {
-            int n = 0;
+            unsigned long long now = now_ms();
+            /* Drain the socket before doing anything else. Reading one packet per
+             * wakeup looks equivalent and is not: a peer sends a probe every
+             * second, so a loop that wakes once a second falls behind and the
+             * queue it grows is exactly where this link's test echo has to wait
+             * for space. */
+            for (;;) {
+                int n = 0;
 #ifndef _WIN32
-            do {
-                n = recv(u, buf, (int)sizeof(buf), 0);
-            } while (n < 0 && errno == EINTR && p->running);
+                do {
+                    n = recv(u, buf, (int)sizeof(buf), 0);
+                } while (n < 0 && errno == EINTR && p->running);
 #else
-            n = recv(u, buf, (int)sizeof(buf), 0);
+                n = recv(u, buf, (int)sizeof(buf), 0);
 #endif
-            if (n > 0) {
+                if (n <= 0) break;
                 /* Anything landing here arrived straight from the peer. */
                 p->direct = 1;
-                send(u, buf, (int)n, 0);
+                p2p_record_test_echo(p, buf, n);
+                if (p2p_echo_wanted(echoed_seen, echoed, buf, n))
+                    send(u, buf, (int)n, 0);
             }
-            send(u, probe, (int)sizeof(probe), 0);
-            probe[3 + ID_LEN]++;
-            SLEEP_MS(1000);
+            /* An outstanding test that never came back is the answer: the peer
+             * cannot reach us. Drop the previous result so a link that died
+             * between two tests stops reporting itself verified. Checked before
+             * the send below, so no timer ever compares a stamp against a clock
+             * reading taken before that stamp was written. */
+            if (p->test_pending &&
+                ms_since(now, p->test_sent_ms) >= LINK_TEST_TIMEOUT_MS) {
+                p->test_pending = 0;
+                p->tested = 0;
+                p->rtt_bucket = RTT_UNKNOWN_BUCKET;
+            }
+            /* The punch probe goes out on its timer whether or not the link is up:
+             * this packet is what opens the NAT mapping in the first place, so
+             * gating it on directness would mean a link that has not punched yet
+             * never gets the chance to. */
+            if (ms_since(now, last_probe) >= PROBE_INTERVAL_MS) {
+                send(u, probe, (int)sizeof(probe), 0);
+                probe[3 + ID_LEN]++;
+                last_probe = now;
+            }
+            /* Test a link that is already carrying traffic, on its own timer.
+             * The first test goes out immediately so a freshly punched path is
+             * reported as verified in the next status report rather than after
+             * an interval of nothing but a self-reported punch. */
+            if (p->direct && !p->test_pending &&
+                ms_since(now, last_test) >= LINK_TEST_INTERVAL_MS) {
+                test[3 + ID_LEN] = ++p->test_seq;
+                /* The clock is re-read here rather than reusing the one taken at
+                 * the top of the pass: the drain above can block for a timeout,
+                 * and that wait would otherwise be charged to the peer as
+                 * latency, reporting a fast local link as a slow one. */
+                p->test_sent_ms = now_ms();
+                p->test_pending = 1;
+                last_test = now;
+                send(u, test, (int)sizeof(test), 0);
+            }
         }
+        /* A result belongs to the path it was measured on. */
+        p->test_pending = 0;
+        p->tested = 0;
+        p->rtt_bucket = RTT_UNKNOWN_BUCKET;
         CLOSE_SOCK(u);
     }
     p->running = 0;
@@ -642,7 +877,6 @@ static void p2p_start(const char *id, uint32_t ip, uint16_t port)
 
 /* ---- Rendezvous hub socket (CMD_P2P_HUB) ---------------------------------- */
 
-static char g_node_id[ID_LEN + 1];
 static volatile int g_hub_running = 0;
 static struct sockaddr_in g_hub_addr;
 static thread_t g_hub_thr;
@@ -838,7 +1072,23 @@ THREAD_FN(trp_session)
  * completely silent, and every NAT, load balancer and idle-timeout in the path
  * would eventually drop a socket that carries no traffic. The server reads a
  * 0xFE report before it looks at the count, so an empty one still refreshes
- * liveness. */
+ * liveness.
+ *
+ * Each flags byte also carries that link's test result, so the server never has
+ * to guess at latency: bit 0 is the punch result it has always read, bit 1 says
+ * a round trip actually completed, and bits 2-5 are its bucketed latency. */
+static unsigned char p2p_report_flags(const struct p2p_peer *p)
+{
+    unsigned char flags = 0;
+    if (p->direct) flags |= P2P_FLAG_DIRECT;
+    if (p->tested) {
+        flags |= P2P_FLAG_TESTED;
+        flags |= (unsigned char)((p->rtt_bucket << P2P_FLAG_RTT_SHIFT) &
+                                 P2P_FLAG_RTT_MASK);
+    }
+    return flags;
+}
+
 THREAD_FN(status_thread)
 {
     unsigned char report[2 + P2P_MAX * (ID_LEN + 1)];
@@ -857,7 +1107,7 @@ THREAD_FN(status_thread)
         for (i = 0; i < P2P_MAX; i++) {
             if (!g_peers[i]) continue;
             memcpy(report + 2 + n * (ID_LEN + 1), g_peers[i]->id, ID_LEN);
-            report[2 + n * (ID_LEN + 1) + ID_LEN] = g_peers[i]->direct ? 0x01 : 0x00;
+            report[2 + n * (ID_LEN + 1) + ID_LEN] = p2p_report_flags(g_peers[i]);
             n++;
         }
         mutex_unlock(&g_p2p_mu);

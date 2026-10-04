@@ -210,10 +210,47 @@ manual `./tun <ip> <psk>` still backgrounds as before.
 | FRP session | Node listens on `local_port` (check `ss -tlnp \| grep tun`). |
 | P2P session | Node holds a UDP socket; constant keepalive traffic to the target. |
 | P2P hub | One UDP socket registered with `server:7001`; a `direct` link on the dashboard means the punch completed. |
+| Link test | Every few seconds each side sends a small packet the peer echoes back; the dashboard shows the round trip in milliseconds and marks the link `no answer` when echoes stop. |
 | After Reset  | All listeners/sockets from FRP, TRP, P2P and the hub are gone; node back to idle. |
 
 Toggling is seamless: sending a new `0x01`/`0x02` replaces the previous FRP or P2P session
 automatically, and a `0x00` always stops everything.
+
+### Link test
+
+A hole punch completing is not the same as two devices being able to talk. The punch is
+one packet in one direction, and it can succeed against a peer whose path has since
+changed; the client keeps reporting `direct` in that case, because that is what the
+punch said. The link test is the separate check.
+
+Once a peer socket is up, each side sends a 12-byte packet every three seconds:
+
+```text
+'P','1','T' | node_id(8) | seq(1)
+```
+
+The peer echoes it back byte for byte. Only the echo of the sequence that is
+outstanding counts, which is what makes it a measurement rather than a receipt: a
+stale echo of an earlier test cannot pass for the current one, and a probe echo
+cannot pass for a test at all. The round trip is timed on a monotonic clock, so an
+NTP step cannot invent latency.
+
+The result travels up in the existing status report, inside the flags byte that
+already carried `direct`:
+
+| Bit | Meaning |
+| --- | ------- |
+| 0 | a punch landed and the peer answered |
+| 1 | a link test completed |
+| 2-5 | round trip, in four bits of latency buckets |
+
+Everything is additive inside that one byte, so a client and a server from
+different releases still read each other's reports: a client too old to test
+reports bit 0 alone, which the server reads as "punched, never measured" and shows
+as `no answer` rather than as a link that works.
+
+A test that gets no echo within two seconds clears the result. That is what keeps a
+link which dies between two tests from keeping its old round trip on the dashboard.
 
 ---
 
@@ -221,6 +258,10 @@ automatically, and a `0x00` always stops everything.
 
 `make` builds `tun` for your host machine. The Makefile also exposes per-platform targets:
 `make linux`, `make windows`, `make macos`, `make android`, or `make release` for all of them.
+
+`make test` builds and runs the link test against a fake peer over loopback. It exercises the
+real `p2p_thread`, so it is the check for anything touching hole punching, echoing or the
+link-test result — it includes `tun.c` directly and is never shipped in a release.
 
 ### Release build (all platforms at once)
 
