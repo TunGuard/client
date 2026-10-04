@@ -8,3 +8,4 @@ tun.conf
 device_id
 connection
 .*.swp
+tests/link_test
